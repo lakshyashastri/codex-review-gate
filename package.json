@@ -1,0 +1,22 @@
+{
+  "name": "codex-review-gate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Require completed Codex reviews on the current pull-request commit.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "verify": "npm run format:check && npm test"
+  },
+  "devDependencies": {
+    "prettier": "3.9.6",
+    "vitest": "5.0.0",
+    "yaml": "2.9.1"
+  }
+}

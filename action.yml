@@ -1,0 +1,37 @@
+name: Codex Review Gate
+description: Require a completed Codex review of the current PR commit.
+author: Lakshya Shastri
+branding:
+  icon: check-circle
+  color: green
+inputs:
+  github-token:
+    description: Token with contents, issues and pull-requests read, and statuses write permissions.
+    default: ${{ github.token }}
+  protected-branches:
+    description: Literal target branch names, separated by commas or newlines. No wildcards.
+    default: main
+  pull-request-number:
+    description: PR number for manual runs. Otherwise inferred from the triggering event.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Check Codex review evidence
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        CODEX_GATE_ACTION_PATH: ${{ github.action_path }}
+        CODEX_GATE_BRANCHES: ${{ inputs.protected-branches }}
+        CODEX_GATE_PR: ${{ inputs.pull-request-number }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const { pathToFileURL } = await import('node:url');
+          const { join } = await import('node:path');
+          const entry = pathToFileURL(join(process.env.CODEX_GATE_ACTION_PATH, 'src/gate.mjs')).href;
+          const { default: runGate, parseBranches } = await import(entry);
+          const explicitPr = process.env.CODEX_GATE_PR;
+          const gateContext = explicitPr
+            ? { ...context, repo: context.repo, payload: { ...context.payload, pull_request: undefined, issue: undefined, inputs: { pr: explicitPr } } }
+            : context;
+          await runGate({ github, context: gateContext, core, protectedBranches: parseBranches(process.env.CODEX_GATE_BRANCHES) });
