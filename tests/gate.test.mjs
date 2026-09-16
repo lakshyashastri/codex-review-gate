@@ -5,9 +5,11 @@ import { parse } from 'yaml';
 import { compileFunction, constants } from 'node:vm';
 import runGate, {
   CODEX_BOT_ID,
+  ACTIONS_BOT_ID,
   completedReview,
   reviewDecision,
   parseBranches,
+  parseReviewTimeoutMinutes,
 } from '../src/gate.mjs';
 
 const HEAD = '2db9380083cb439a58d3e9b0b9631bbfb50394e4';
@@ -52,6 +54,10 @@ function setup({
   commentReactions = [],
   openPulls = [],
   protectedBranches = ['dev', 'main'],
+  reviewTimeoutMinutes = 0,
+  now = Date.now,
+  sleep,
+  statusHistory = [],
 } = {}) {
   const api = {
     openPulls: vi.fn().mockResolvedValue(openPulls),
@@ -62,7 +68,20 @@ function setup({
     commentReactions: vi.fn().mockResolvedValue(commentReactions),
     commit: vi.fn().mockResolvedValue({ data: { sha: HEAD } }),
     pull: vi.fn().mockResolvedValue({ data: PULL }),
-    status: vi.fn().mockResolvedValue({}),
+    statuses: vi
+      .fn()
+      .mockImplementation(({ ref }) =>
+        Promise.resolve(statusHistory.filter((status) => status.sha === ref)),
+      ),
+    status: vi.fn().mockImplementation((status) => {
+      const data = {
+        ...status,
+        creator: { id: ACTIONS_BOT_ID },
+        created_at: new Date(now()).toISOString(),
+      };
+      statusHistory.push(data);
+      return Promise.resolve({ data });
+    }),
   };
   const github = {
     paginate: vi.fn((method, options) => method(options)),
@@ -71,7 +90,11 @@ function setup({
       issues: { listComments: api.comments, listEventsForTimeline: api.timeline },
       pulls: { list: api.openPulls, listReviews: api.reviews, get: api.pull },
       reactions: { listForIssue: api.reactions, listForIssueComment: api.commentReactions },
-      repos: { getCommit: api.commit, createCommitStatus: api.status },
+      repos: {
+        getCommit: api.commit,
+        createCommitStatus: api.status,
+        listCommitStatusesForRef: api.statuses,
+      },
     },
   };
   const context = {
@@ -86,7 +109,16 @@ function setup({
     context,
     decision: () =>
       reviewDecision({ github, ...context.repo, number: 3, headSha: HEAD, protectedBranches }),
-    run: () => runGate({ github, context, core: { info: vi.fn() }, protectedBranches }),
+    run: () =>
+      runGate({
+        github,
+        context,
+        core: { info: vi.fn() },
+        protectedBranches,
+        reviewTimeoutMinutes,
+        now,
+        sleep,
+      }),
   };
 }
 
@@ -324,6 +356,8 @@ describe('publishing the merge requirement', () => {
     const fixture = setup();
     fixture.api.pull
       .mockResolvedValueOnce({ data: PULL })
+      .mockResolvedValueOnce({ data: PULL })
+      .mockResolvedValueOnce({ data: PULL })
       .mockResolvedValue({ data: { ...PULL, head: { sha: OTHER_HEAD } } });
     await fixture.run();
     expect(fixture.api.status.mock.calls.map(([status]) => status.state)).toEqual(['pending']);
@@ -333,6 +367,8 @@ describe('publishing the merge requirement', () => {
     const fixture = setup();
     fixture.api.pull
       .mockResolvedValueOnce({ data: PULL })
+      .mockResolvedValueOnce({ data: PULL })
+      .mockResolvedValueOnce({ data: PULL })
       .mockResolvedValue({ data: { ...PULL, state: 'closed' } });
     await fixture.run();
     expect(fixture.api.status.mock.calls.map(([status]) => status.state)).toEqual(['pending']);
@@ -341,6 +377,8 @@ describe('publishing the merge requirement', () => {
   it('never publishes success if the target changes while the commit stays the same', async () => {
     const fixture = setup();
     fixture.api.pull
+      .mockResolvedValueOnce({ data: PULL })
+      .mockResolvedValueOnce({ data: PULL })
       .mockResolvedValueOnce({ data: PULL })
       .mockResolvedValue({ data: { ...PULL, base: { ref: 'main' } } });
     await fixture.run();
@@ -480,10 +518,11 @@ describe('composite action entry point', () => {
     ['github', 'context', 'core'],
     { importModuleDynamically: constants.USE_MAIN_CONTEXT_DEFAULT_LOADER },
   );
-  const runAction = (fixture, pr = '') => {
+  const runAction = (fixture, pr = '', timeout = '0') => {
     vi.stubEnv('CODEX_GATE_ACTION_PATH', fileURLToPath(new URL('..', import.meta.url)));
     vi.stubEnv('CODEX_GATE_BRANCHES', 'develop');
     vi.stubEnv('CODEX_GATE_PR', pr);
+    vi.stubEnv('CODEX_GATE_REVIEW_TIMEOUT', timeout);
     fixture.api.pull.mockResolvedValue({ data: { ...PULL, base: { ref: 'develop' } } });
     return execute(fixture.github, fixture.context, { info: vi.fn() });
   };
@@ -533,11 +572,242 @@ describe('composite action entry point', () => {
     );
   });
 
+  it('wires the optional timeout input into the action', async () => {
+    vi.useFakeTimers();
+    const fixture = setup({ comments: [] });
+    const run = runAction(fixture, '', '12');
+    await vi.runAllTimersAsync();
+    await run;
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        state: 'success',
+        description: expect.stringContaining('wait expired after 12 min'),
+      }),
+    );
+  });
+
+  it('rejects invalid timeout input before reaching GitHub', async () => {
+    const fixture = setup();
+    await expect(runAction(fixture, '', '-1')).rejects.toThrow('review-timeout-minutes');
+    expect(fixture.api.pull).not.toHaveBeenCalled();
+  });
+
   it('rejects code-shaped PR input as invalid data before reaching GitHub', async () => {
     const fixture = setup();
     await expect(runAction(fixture, '1; throw new Error("executed")')).rejects.toThrow(
       'valid PR number',
     );
     expect(fixture.api.pull).not.toHaveBeenCalled();
+  });
+});
+
+const START = Date.parse('2026-09-17T00:00:00Z');
+function marker(overrides = {}) {
+  return {
+    sha: HEAD,
+    context: 'Codex review (dev)',
+    state: 'pending',
+    description: 'Codex review wait started (PR #3).',
+    creator: { id: ACTIONS_BOT_ID },
+    target_url: 'https://github.com/example/game/actions/runs/99',
+    created_at: new Date(START).toISOString(),
+    ...overrides,
+  };
+}
+function timeoutSetup({ elapsed = 0, ...options } = {}) {
+  let time = START + elapsed;
+  const sleep = vi.fn(async (ms) => {
+    time += ms;
+  });
+  const fixture = setup({
+    comments: [],
+    reviewTimeoutMinutes: 12,
+    now: () => time,
+    sleep,
+    ...options,
+  });
+  return { ...fixture, sleep, elapsed: () => time - START };
+}
+
+describe('optional review timeout', () => {
+  it.each(['-1', '1.5', '61', 'abc', '', ' 12', '12;process.exit()', 'Infinity'])(
+    'rejects invalid input %j',
+    (value) => {
+      expect(() => parseReviewTimeoutMinutes(value)).toThrow('review-timeout-minutes');
+    },
+  );
+
+  it('defaults to strict mode and accepts a bounded integer', () => {
+    expect(parseReviewTimeoutMinutes()).toBe(0);
+    expect(parseReviewTimeoutMinutes('12')).toBe(12);
+    expect(parseReviewTimeoutMinutes('60')).toBe(60);
+  });
+
+  it('records a fresh clock, waits twelve minutes, and explicitly reports review bypass', async () => {
+    const fixture = timeoutSetup();
+    await fixture.run();
+    expect(fixture.elapsed()).toBe(720_000);
+    expect(fixture.api.status.mock.calls.map(([status]) => status.state)).toEqual([
+      'pending',
+      'pending',
+      'success',
+    ]);
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        state: 'success',
+        description: 'Review wait expired after 12 min; no verified Codex review.',
+      }),
+    );
+  });
+
+  it.each([719_000, 720_000])(
+    'does not pass before the persisted twelve-minute boundary (%i ms)',
+    async (elapsed) => {
+      const fixture = timeoutSetup({ elapsed, statusHistory: [marker()] });
+      await fixture.run();
+      expect(fixture.elapsed()).toBe(720_000);
+      expect(fixture.sleep.mock.calls).toEqual(elapsed === 719_000 ? [[1000]] : []);
+      expect(fixture.api.status).toHaveBeenLastCalledWith(
+        expect.objectContaining({ state: 'success' }),
+      );
+    },
+  );
+
+  it('retains the original clock on rerun and comment edits', async () => {
+    const history = [marker()];
+    const fixture = timeoutSetup({ elapsed: 600_000, statusHistory: history });
+    fixture.context.payload = { issue: { number: 3, pull_request: {} }, action: 'edited' };
+    await fixture.run();
+    expect(fixture.elapsed()).toBe(720_000);
+    expect(history.filter((status) => status.description === marker().description)).toHaveLength(1);
+  });
+
+  it.each([
+    ['another commit', { sha: OTHER_HEAD }],
+    ['another PR', { description: 'Codex review wait started (PR #4).' }],
+    ['another base', { context: 'Codex review (main)' }],
+    ['a human status', { creator: { id: 123 } }],
+    ['another repository run', { target_url: 'https://github.com/attacker/repo/actions/runs/99' }],
+    ['a non-workflow URL', { target_url: 'https://github.com/example/game/pull/3' }],
+    ['a success status', { state: 'success' }],
+    ['a non-marker status', { description: 'Waiting for Codex to review this commit.' }],
+  ])('does not reuse %s to backdate the timer', async (_label, overrides) => {
+    const fixture = timeoutSetup({ elapsed: 720_000, statusHistory: [marker(overrides)] });
+    await fixture.run();
+    expect(fixture.elapsed()).toBe(1_440_000);
+  });
+
+  it.each(['invalid', '2026-09-18T00:00:00Z'])(
+    'fails closed on an invalid trusted timer timestamp %s',
+    async (created_at) => {
+      const fixture = timeoutSetup({ statusHistory: [marker({ created_at })] });
+      await expect(fixture.run()).rejects.toThrow('Invalid GitHub timestamp');
+      expect(fixture.api.status).toHaveBeenLastCalledWith(
+        expect.objectContaining({ state: 'error' }),
+      );
+    },
+  );
+
+  it('accepts a genuine review immediately without starting a timer', async () => {
+    const fixture = timeoutSetup({ comments: [SUMMARY] });
+    await fixture.run();
+    expect(fixture.sleep).not.toHaveBeenCalled();
+    expect(fixture.api.statuses).not.toHaveBeenCalled();
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        state: 'success',
+        description: expect.stringContaining('Codex reviewed'),
+      }),
+    );
+  });
+
+  it('accepts a genuine review that arrives during the wait', async () => {
+    const fixture = timeoutSetup();
+    fixture.api.comments.mockResolvedValueOnce([]).mockResolvedValue([SUMMARY]);
+    await fixture.run();
+    expect(fixture.elapsed()).toBe(30_000);
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        state: 'success',
+        description: expect.stringContaining('Codex reviewed'),
+      }),
+    );
+  });
+
+  it.each([
+    ['new head', { head: { sha: OTHER_HEAD } }],
+    ['new base', { base: { ref: 'main' } }],
+    ['closed PR', { state: 'closed' }],
+  ])('publishes no stale success if there is a %s while waiting', async (_label, change) => {
+    const fixture = timeoutSetup();
+    fixture.sleep.mockImplementationOnce(async () => {
+      fixture.api.pull.mockResolvedValue({ data: { ...PULL, ...change } });
+    });
+    await fixture.run();
+    expect(fixture.api.status.mock.calls.some(([status]) => status.state === 'success')).toBe(
+      false,
+    );
+  });
+
+  it.each(['statuses', 'comments', 'timeline', 'openPulls'])(
+    'does not treat a %s API failure as a timeout',
+    async (endpoint) => {
+      const fixture = timeoutSetup({ elapsed: 720_000, statusHistory: [marker()] });
+      fixture.api[endpoint].mockRejectedValue(new Error('API unavailable'));
+      await expect(fixture.run()).rejects.toThrow('API unavailable');
+      expect(fixture.api.status).toHaveBeenLastCalledWith(
+        expect.objectContaining({ state: 'error' }),
+      );
+    },
+  );
+
+  it('does not bypass duplicate open heads after twelve minutes', async () => {
+    const fixture = timeoutSetup({
+      elapsed: 720_000,
+      statusHistory: [marker()],
+      openPulls: [{ ...PULL, number: 4 }],
+    });
+    await fixture.run();
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        state: 'pending',
+        description: expect.stringContaining('Another open PR'),
+      }),
+    );
+  });
+
+  it('does not bypass retargeted PRs after twelve minutes', async () => {
+    const fixture = timeoutSetup({ elapsed: 720_000, statusHistory: [marker()] });
+    fixture.api.timeline.mockResolvedValue([{ event: 'base_ref_changed' }]);
+    await fixture.run();
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        state: 'pending',
+        description: expect.stringContaining('Target branch changed'),
+      }),
+    );
+  });
+
+  it('never uses timeout markers when the option is disabled', async () => {
+    const fixture = timeoutSetup({
+      reviewTimeoutMinutes: 0,
+      elapsed: 720_000,
+      statusHistory: [marker()],
+    });
+    await fixture.run();
+    expect(fixture.sleep).not.toHaveBeenCalled();
+    expect(fixture.api.statuses).not.toHaveBeenCalled();
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({ state: 'pending' }),
+    );
+  });
+
+  it('requires a GitHub Actions-created timer marker', async () => {
+    const fixture = timeoutSetup();
+    fixture.api.status.mockResolvedValue({ data: marker({ creator: { id: 123 } }) });
+    await expect(fixture.run()).rejects.toThrow('GitHub Actions token');
+    expect(fixture.api.status).toHaveBeenLastCalledWith(
+      expect.objectContaining({ state: 'error' }),
+    );
   });
 });

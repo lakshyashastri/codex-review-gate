@@ -12,7 +12,7 @@ The gate works on GitHub.com and has no connection to your application's languag
 2. Set `protected-branches` to your literal target branch names, for example:
 
    ```yaml
-   - uses: lakshyashastri/codex-review-gate@v0.1.0
+   - uses: lakshyashastri/codex-review-gate@v0.2.0
      with:
        protected-branches: |
          main
@@ -29,11 +29,12 @@ For an immutable installation, replace the release tag with its full commit SHA 
 
 ### Inputs
 
-| Input                 | Default               | Purpose                                                                                      |
-| --------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
-| `protected-branches`  | `main`                | Exact branch names, separated by commas or newlines. No wildcards.                           |
-| `pull-request-number` | Inferred from event   | Explicit PR number for a manual run. The example supplies its `pr` input.                    |
-| `github-token`        | `${{ github.token }}` | Repository token with the permissions below. The default GitHub Actions token is sufficient. |
+| Input                    | Default               | Purpose                                                                                                  |
+| ------------------------ | --------------------- | -------------------------------------------------------------------------------------------------------- |
+| `protected-branches`     | `main`                | Exact branch names, separated by commas or newlines. No wildcards.                                       |
+| `review-timeout-minutes` | `0` (strict)          | Optionally pass without a verified review after 1–60 minutes. Requires the default GitHub Actions token. |
+| `pull-request-number`    | Inferred from event   | Explicit PR number for a manual run. The example supplies its `pr` input.                                |
+| `github-token`           | `${{ github.token }}` | Repository token with the permissions below. The default GitHub Actions token is sufficient.             |
 
 ```yaml
 permissions:
@@ -45,7 +46,30 @@ permissions:
 
 The merge requirement is the **commit status** named `Codex review (<branch>)`, not the workflow job named “Update Codex review status”. A successful workflow run can still leave that commit status pending while Codex reviews the PR.
 
-## What counts as completed
+## Optional review timeout
+
+Strict verification remains the default. To stop waiting indefinitely for Codex, opt in:
+
+```yaml
+timeout-minutes: 15 # Job timeout must exceed the configured review wait.
+steps:
+  - uses: lakshyashastri/codex-review-gate@v0.2.0
+    with:
+      protected-branches: main
+      review-timeout-minutes: '12'
+```
+
+Keep all the triggers, permissions and concurrency settings from the complete example workflow. The action polls every 30 seconds during the wait; no scheduled workflow is needed. It can pass earlier when the normal review evidence arrives. This consumes GitHub Actions runner time while waiting. Workflow queueing and API latency mean twelve minutes is a review waiting period, not an exact guarantee measured from the push.
+
+The clock starts when the gate first records that it is waiting for a review of this PR's current commit and target branch. A pending commit status records the start using GitHub's timestamp. Reruns, workflow cancellation and summary edits reuse that clock. A new head commit starts a new clock; enabling the option on an existing PR also starts fresh unless this marker already exists. Commit author dates and older unmarked pending statuses cannot backdate it. Use the default `github-token`: timeout markers must be authored by GitHub Actions' verified bot (numeric account ID `41898282`) and link to a workflow run in this repository.
+
+**A timeout is a review bypass, not evidence of approval.** After twelve minutes without verifiable completion, the status succeeds with “Review wait expired after 12 min; no verified Codex review.” This includes Codex being slow or rate-limited and a missing/stale/unrecognized summary. API errors, invalid timer evidence, duplicate open PRs sharing the commit, and retargeted PRs still do not pass through the timeout.
+
+Keep **Require conversation resolution** enabled. Existing and late-arriving unresolved threads still block merging through GitHub's native protection, even after this status passes. A review can arrive after the PR has already been merged; the timeout deliberately accepts that possibility. All other required CI checks remain independent.
+
+If a workflow is canceled and no replacement runs, or exceeds its job timeout, the status can remain pending. Rerun the workflow to resume the persisted wait. Set `review-timeout-minutes: '0'` to restore strict verification and rerun affected PRs; existing successful statuses are not automatically revoked by changing configuration.
+
+## What counts as completed in strict verification
 
 All of the following must hold:
 
@@ -56,7 +80,7 @@ All of the following must hold:
 
 A 👀 reaction, a human's 👍, a stale summary or an old review is insufficient. The gate checks the head and target branch again before publishing success. Closed PRs and unconfigured target branches are skipped.
 
-A completed review **with findings** satisfies review completion. GitHub's conversation-resolution requirement separately blocks unresolved review threads, including outdated ones. Resolving a thread acknowledges the finding; this gate does not verify that the code fixes it or judge whether a dismissal is justified. Pushed fixes need a review of the new commit.
+The optional timeout above is a separate path to success; it does not change these review-evidence rules. A completed review **with findings** satisfies review completion. GitHub's conversation-resolution requirement separately blocks unresolved review threads, including outdated ones. Resolving a thread acknowledges the finding; this gate does not verify that the code fixes it or judge whether a dismissal is justified. Pushed fixes need a review of the new commit.
 
 ## Limits and troubleshooting
 
@@ -64,8 +88,8 @@ This is a lightweight merge gate, not an absolute per-PR lock:
 
 - **Shared commit statuses.** GitHub associates statuses with commits. A second PR reusing an approved commit can briefly inherit success before its workflow runs. The action blocks detected duplicate open PRs against configured targets and refreshes related statuses when duplicates move or close, but concurrent runs can still overwrite shared statuses. Keep open PRs on distinct commits. If a refresh is missed, rerun the workflow for the affected PR.
 - **Retargeted PRs.** Codex's summary identifies a commit, not the reviewed base branch. Any recorded target-branch change blocks the PR, even if a later review completes. Open a new PR against the intended target.
-- **Observed summary format.** The parser uses Codex's observed Markdown output, not a stable public completion API. Unknown or changed formats remain pending until the parser is updated. API failures produce an error status instead of success.
-- **Reaction delivery.** Codex's comment creation/edits trigger checks. Reactions have no dedicated workflow trigger; the action waits up to 30 seconds for a submitted review or 👍 after a completed summary appears. If it arrives later, run **Codex review gate** from Actions with the PR number.
+- **Observed summary format.** The parser uses Codex's observed Markdown output, not a stable public completion API. Unknown or changed formats remain pending in strict mode until the parser is updated. With a review timeout enabled, they can pass once its wait expires. API failures always produce an error status instead of success.
+- **Reaction delivery.** Codex's comment creation/edits trigger checks. Reactions have no dedicated workflow trigger; the action waits up to 30 seconds for a submitted review or 👍 after a completed summary appears. If it arrives later in strict mode, run **Codex review gate** from Actions with the PR number. With a timeout enabled, the action continues checking during its configured wait.
 - **Automatic reviews.** If pushing new code has not started a review, request one using your Codex integration, for example by commenting `@codex review`.
 - **Permissions and policy.** Actions and the required token permissions must be allowed by your repository or organization. GitHub Enterprise Server is unsupported because the verified bot identity is GitHub.com-specific. Merge queues are not supported by the supplied workflow.
 
@@ -88,7 +112,7 @@ npm ci --ignore-scripts
 npm run verify
 ```
 
-`npm run verify` runs formatting checks and tests, matching CI. Tests use synthetic GitHub API responses and cover summary parsing, bot identity, stale evidence, branch configuration, event handling, status publication, API failures and the composite action's entry point. No application server, database or credentials are needed for local tests.
+`npm run verify` runs formatting checks and tests, matching CI. Tests use synthetic GitHub API responses and cover summary parsing, bot identity, stale evidence, branch configuration, event handling, status publication, API failures, timeout boundaries, durable clocks across reruns, head changes and the composite action's entry point. No application server, database or credentials are needed for local tests.
 
 Keep the parser conservative: add representative, sanitized fixtures when Codex's format changes, and prove that stale or ambiguous evidence remains blocked. Publish a new versioned release for behavior changes.
 
