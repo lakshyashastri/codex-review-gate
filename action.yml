@@ -11,6 +11,9 @@ inputs:
   protected-branches:
     description: Literal target branch names, separated by commas or newlines. No wildcards.
     default: main
+  review-timeout-minutes:
+    description: Pass without a verified review after this wait (0 disables timeout; maximum 60). Requires the default GitHub Actions token.
+    default: '0'
   pull-request-number:
     description: PR number for manual runs. Otherwise inferred from the triggering event.
     default: ''
@@ -23,15 +26,16 @@ runs:
         CODEX_GATE_ACTION_PATH: ${{ github.action_path }}
         CODEX_GATE_BRANCHES: ${{ inputs.protected-branches }}
         CODEX_GATE_PR: ${{ inputs.pull-request-number }}
+        CODEX_GATE_REVIEW_TIMEOUT: ${{ inputs.review-timeout-minutes }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
           const { pathToFileURL } = await import('node:url');
           const { join } = await import('node:path');
           const entry = pathToFileURL(join(process.env.CODEX_GATE_ACTION_PATH, 'src/gate.mjs')).href;
-          const { default: runGate, parseBranches } = await import(entry);
+          const { default: runGate, parseBranches, parseReviewTimeoutMinutes } = await import(entry);
           const explicitPr = process.env.CODEX_GATE_PR;
           const gateContext = explicitPr
             ? { ...context, repo: context.repo, payload: { ...context.payload, pull_request: undefined, issue: undefined, inputs: { pr: explicitPr } } }
             : context;
-          await runGate({ github, context: gateContext, core, protectedBranches: parseBranches(process.env.CODEX_GATE_BRANCHES) });
+          await runGate({ github, context: gateContext, core, protectedBranches: parseBranches(process.env.CODEX_GATE_BRANCHES), reviewTimeoutMinutes: parseReviewTimeoutMinutes(process.env.CODEX_GATE_REVIEW_TIMEOUT) });

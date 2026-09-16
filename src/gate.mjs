@@ -1,4 +1,5 @@
 export const CODEX_BOT_ID = 199175422;
+export const ACTIONS_BOT_ID = 41898282;
 const SUMMARY_MARKER = '<!-- codex-pull-request-review-summary -->';
 
 // This is Codex's observed GitHub summary format, not a public API contract.
@@ -69,7 +70,11 @@ export async function reviewDecision({
   const summaries = comments.filter(
     (comment) => comment.user?.id === CODEX_BOT_ID && comment.body?.startsWith(SUMMARY_MARKER),
   );
-  const waiting = { state: 'pending', description: 'Waiting for Codex to review this commit.' };
+  const waiting = {
+    state: 'pending',
+    reason: 'WAITING_FOR_REVIEW',
+    description: 'Waiting for Codex to review this commit.',
+  };
   if (summaries.length !== 1) return waiting;
   const summary = summaries[0];
   const review = completedReview(summary.body);
@@ -140,7 +145,51 @@ export async function reviewDecision({
   };
 }
 
-async function updateReviewStatus({ github, context, core, number, protectedBranches }) {
+// A GitHub-created status timestamp survives workflow cancellation/reruns and is
+// scoped to this PR, commit (the status API ref), and target (the status context).
+// Never infer review age from commit dates, comment edits, or an untrusted status.
+async function waitStartedAt({ github, context, number, headSha, statusContext, publish, now }) {
+  const { owner, repo } = context.repo;
+  const description = `Codex review wait started (PR #${number}).`;
+  const runPrefix = `${context.serverUrl}/${owner}/${repo}/actions/runs/`;
+  const isMarker = (status) =>
+    status.context === statusContext &&
+    status.state === 'pending' &&
+    status.description === description &&
+    status.creator?.id === ACTIONS_BOT_ID &&
+    status.target_url?.startsWith(runPrefix) &&
+    /^[1-9][0-9]*$/.test(status.target_url.slice(runPrefix.length));
+  const timestamp = (status) => {
+    const value = Date.parse(status.created_at);
+    if (!Number.isFinite(value) || value > now())
+      throw new Error('Invalid GitHub timestamp for the review timeout clock.');
+    return value;
+  };
+  const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+    owner,
+    repo,
+    ref: headSha,
+    per_page: 100,
+  });
+  const markers = statuses.filter(isMarker);
+  if (markers.length) return Math.min(...markers.map(timestamp));
+  const response = await publish({ state: 'pending', description });
+  if (!response) return null; // The PR moved or closed before the clock was recorded.
+  if (!isMarker(response.data))
+    throw new Error('Review timeouts require statuses created by the GitHub Actions token.');
+  return timestamp(response.data);
+}
+
+async function updateReviewStatus({
+  github,
+  context,
+  core,
+  number,
+  protectedBranches,
+  reviewTimeoutMinutes,
+  now,
+  sleep,
+}) {
   const { owner, repo } = context.repo;
   const getPull = async () =>
     (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
@@ -148,34 +197,71 @@ async function updateReviewStatus({ github, context, core, number, protectedBran
   if (pull.state !== 'open' || !protectedBranches.includes(pull.base.ref)) return;
   const headSha = pull.head.sha;
   const baseRef = pull.base.ref;
-  const publish = (result) =>
-    github.rest.repos.createCommitStatus({
+  const statusContext = `Codex review (${baseRef})`;
+  const isCurrent = async () => {
+    const latest = await getPull();
+    return latest.state === 'open' && latest.head.sha === headSha && latest.base.ref === baseRef;
+  };
+  const publish = async (result) => {
+    if (!(await isCurrent())) return null;
+    return github.rest.repos.createCommitStatus({
       owner,
       repo,
       sha: headSha,
       // Statuses belong to a commit, not a PR. Different target branches need
       // distinct requirements because their reviewed diffs can differ.
-      context: `Codex review (${baseRef})`,
+      context: statusContext,
       target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
       state: result.state,
       description: result.description,
       ...(result.target_url ? { target_url: result.target_url } : {}),
     });
-  await publish({ state: 'pending', description: 'Checking Codex review of this commit.' });
+  };
   try {
-    let decision;
-    // The summary edit can arrive a few seconds before the reaction/review. There
-    // is no reaction webhook, so allow a short bounded grace period for delivery.
-    for (let attempt = 0; attempt < 7; attempt++) {
-      decision = await reviewDecision({ github, owner, repo, number, headSha, protectedBranches });
-      if (!decision.retry || attempt === 6) break;
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    }
-    const latest = await getPull();
-    if (latest.state !== 'open' || latest.head.sha !== headSha || latest.base.ref !== baseRef)
+    if (
+      !(await publish({ state: 'pending', description: 'Checking Codex review of this commit.' }))
+    )
       return;
-    await publish(decision);
-    core.info(decision.description);
+    let startedAt;
+    let deliveryRetries = 0;
+    while (await isCurrent()) {
+      let decision = await reviewDecision({
+        github,
+        owner,
+        repo,
+        number,
+        headSha,
+        protectedBranches,
+      });
+      if (reviewTimeoutMinutes > 0 && decision.reason === 'WAITING_FOR_REVIEW') {
+        startedAt ??= await waitStartedAt({
+          github,
+          context,
+          number,
+          headSha,
+          statusContext,
+          publish,
+          now,
+        });
+        if (startedAt === null) return;
+        const remaining = startedAt + reviewTimeoutMinutes * 60_000 - now();
+        if (remaining > 0) {
+          await sleep(Math.min(30_000, remaining));
+          continue;
+        }
+        decision = {
+          state: 'success',
+          description: `Review wait expired after ${reviewTimeoutMinutes} min; no verified Codex review.`,
+        };
+      } else if (decision.retry && deliveryRetries++ < 6) {
+        // Preserve strict mode's short delivery grace period. Reactions have no
+        // webhook and can arrive just after the completed-summary comment.
+        await sleep(5000);
+        continue;
+      }
+      if (await publish(decision)) core.info(decision.description);
+      return;
+    }
   } catch (error) {
     await publish({
       state: 'error',
@@ -185,7 +271,16 @@ async function updateReviewStatus({ github, context, core, number, protectedBran
   }
 }
 
-export default async function runGate({ github, context, core, protectedBranches = ['main'] }) {
+export default async function runGate({
+  github,
+  context,
+  core,
+  protectedBranches = ['main'],
+  reviewTimeoutMinutes = 0,
+  now = Date.now,
+  sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+}) {
+  reviewTimeoutMinutes = parseReviewTimeoutMinutes(String(reviewTimeoutMinutes));
   if (context.serverUrl !== 'https://github.com')
     throw new Error(
       'This action supports GitHub.com only; its Codex bot identity is GitHub.com-specific.',
@@ -216,7 +311,16 @@ export default async function runGate({ github, context, core, protectedBranches
   }
   const results = await Promise.allSettled(
     [...numbers].map((pr) =>
-      updateReviewStatus({ github, context, core, number: pr, protectedBranches }),
+      updateReviewStatus({
+        github,
+        context,
+        core,
+        number: pr,
+        protectedBranches,
+        reviewTimeoutMinutes,
+        now,
+        sleep,
+      }),
     ),
   );
   const failure = results.find((result) => result.status === 'rejected');
@@ -238,4 +342,11 @@ export function parseBranches(value = 'main') {
       'protected-branches must contain literal branch names, separated by commas or newlines.',
     );
   return branches;
+}
+
+// Bound polling so consumers can give the job a predictable timeout/billing limit.
+export function parseReviewTimeoutMinutes(value = '0') {
+  if (!/^(0|[1-9][0-9]*)$/.test(value) || Number(value) > 60)
+    throw new Error('review-timeout-minutes must be an integer from 0 to 60 (0 disables timeout).');
+  return Number(value);
 }
